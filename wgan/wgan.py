@@ -17,6 +17,46 @@ import numpy as np
 import matplotlib.pyplot as plt
 from time import time
 
+def collect_features(data, cate_word_variable):
+    """
+        Returns the number of different values of a specificed categorical word variable.
+    """
+    features_dict = {}
+    for obs in data[cate_word_variable]:
+        try:
+            tokens = obs.split(',')
+            for token in tokens:
+                features_dict[token] = features_dict.setdefault(token, 0) + 1
+        except:
+            pass
+    
+    return features_dict
+
+def get_top_features(features, n_top_features = 0):
+    """
+        Returns the top n_top_features from features dict
+    """
+
+    return dict(sorted(features.items(), key = lambda skill: skill[1])[-n_top_features:])
+
+
+def make_feature_vector(observation, top_features):
+    """
+        Returns tensor with one-hot embedding for top_features
+    """
+    dim = len(top_features)
+    x = np.zeros(dim)
+    try:
+        tokens = observation.split(',')
+        # print(posting_tokens)
+        # print(top_skills)
+        for idx, skill in enumerate(top_features.keys()):
+            if skill in tokens:
+                x[idx] = 1
+        return torch.from_numpy(x).float()
+    except:
+            pass
+    
 
 class DataWrapper(object):
     """Class for processing raw training data for training Wasserstein GAN
@@ -62,10 +102,44 @@ class DataWrapper(object):
                          context=context_vars)
         self.variables = variables
         continuous, context = [torch.tensor(np.array(df[variables[_]])).to(torch.float) for _ in ("continuous", "context")]
+        
+        
+        # ! This is where the vectors are created: insert make_feature_vector here
+        # ! print(f"continuous: {continuous}")
+        # ! print(f"context: {context}")
+        
         self.means = [x.mean(0, keepdim=True) for x in (continuous, context)]
         self.stds  = [x.std(0,  keepdim=True) + 1e-5 for x in (continuous, context)]
+
+        # print(f"means: {self.means}")
+        # print(f"stds: {self.stds}")
+
         self.cat_dims = [df[v].nunique() for v in variables["categorical"]]
-        self.cat_labels = [torch.tensor(pd.get_dummies(df[v]).columns.to_numpy()).to(torch.float) for v in variables["categorical"]]
+        # print(f"cat_dims: {self.cat_dims}")
+
+        #*
+        self.words_to_int = {}
+        self.int_to_words = {}
+
+        self.cat_labels = []
+        for v in variables["categorical"]:
+            if not isinstance(df[v][0], float):
+                feature_labels = pd.get_dummies(df[v]).columns
+                self.words_to_int[v] = {feature: idx for idx, feature in enumerate(feature_labels.to_numpy())}
+                self.int_to_words[v] = {idx: feature for idx, feature in enumerate(feature_labels.to_numpy())}
+                source = df[v].map(self.words_to_int[v])
+            else:
+                source = df[v]
+
+            self.cat_labels.append((v, torch.tensor(pd.get_dummies(source).columns.to_numpy()).to(torch.float)))
+
+            
+        # print(f"words_to_int table: {self.words_to_int}")
+        # print(f"int_to_words table: {self.int_to_words}")
+        # print(f"cat labels: {self.cat_labels}")
+
+        #*
+        
         self.cont_bounds = [[continuous_lower_bounds[v] if v in continuous_lower_bounds.keys() else -1e8 for v in variables["continuous"]],
                             [continuous_upper_bounds[v] if v in continuous_upper_bounds.keys() else 1e8 for v in variables["continuous"]]]
         self.cont_bounds = (torch.tensor(self.cont_bounds).to(torch.float) - self.means[0]) / self.stds[0]
@@ -89,15 +163,25 @@ class DataWrapper(object):
         """
         x, context = [torch.tensor(np.array(df[self.variables[_]])).to(torch.float) for _ in ("continuous", "context")]
         x, context = [(x-m)/s for x,m,s in zip([x, context], self.means, self.stds)]
+
+        
+
         if len(self.variables["categorical"]) > 0:
+            #!This is where equivalent of one-hot encodings are made
+            # print(f"categorical looks like: {pd.get_dummies(df[self.variables['categorical']], columns=self.variables['categorical'])}")
+
             categorical = torch.tensor(pd.get_dummies(df[self.variables["categorical"]], columns=self.variables["categorical"]).to_numpy())
+
+            
             x = torch.cat([x, categorical.to(torch.float)], -1)
         total = torch.cat([x, context], -1)
         if not torch.all(total==total):
             raise RuntimeError("It looks like there are NaNs your data, at least after preprocessing. This is currently not supported!")
+
+        
         return x, context
 
-    def deprocess(self, x, context):
+    def deprocess(self, x, context, n_features = 1):
         """
         Unscale tensors from WGAN output to original scale
 
@@ -115,12 +199,55 @@ class DataWrapper(object):
         continuous, categorical = x.split((self.means[0].size(-1), sum(self.cat_dims)), -1)
         continuous, context = [x*s+m for x,m,s in zip([continuous, context], self.means, self.stds)]
         if categorical.size(-1) > 0:
-            categorical = torch.cat([l[torch.multinomial(p, 1)] for p, l in zip(categorical.split(self.cat_dims, -1), self.cat_labels)], -1)
-        df = pd.DataFrame(dict(zip(self.variables["continuous"] + self.variables["categorical"] + self.variables["context"],
+
+            # #*
+            # new_categorical = []
+            # for p, l in zip(categorical.split(self.cat_dims, -1), self.cat_labels):
+            #     if l[0] in self.cat_encoding_table:
+            #         encoding = list(self.cat_encoding_table[l[0]].keys())
+            #         new_categorical.append(l[torch.multinomial(p,1)])
+            #         print(f"addend: {categorical[-1]}")
+            #     # else:
+            #         # categorical.append(l[])
+            new_categorical = []
+            for p, l in zip(categorical.split(self.cat_dims, -1), self.cat_labels):
+                if l[0] in self.int_to_words:
+                    # print(f"test4: {[l[1][i] for i in [torch.multinomial(p, n_features)]][0]}")
+                    new_categorical.append([l[1][i] for i in [torch.multinomial(p, n_features)]][0])
+                else:
+                    # print(f"size: {p.size()}")
+                    # print(f'test3: {[[0] for _ in range(1, n_top_features)]}')
+                    # print(f'test2: {torch.tensor([[0] for _ in range(1, n_top_features)])}')
+                    # print(f'test: {}')
+                    new_categorical.append(torch.cat([l[1][torch.multinomial(p, 1)], torch.tensor([[0] for _ in range(1, n_features)] * p.size()[0])], -1 ))
+            categorical = torch.cat(new_categorical, -1)
+            # print(f"categorical: {categorical}")
+            #*
+        new_variables_categorical = []
+        for idx, var in enumerate(self.variables["categorical"]):
+            new_variables_categorical.append(var)
+            filler_vars = [var + str(i) for i in range(1, n_features)]
+            new_variables_categorical += filler_vars
+
+            if var in self.words_to_int:
+                for f_var in filler_vars:
+                    self.words_to_int[f_var] = self.words_to_int[var]
+                    self.int_to_words[f_var] = self.int_to_words[var]
+                
+            # print(f"test 5: {new_variables_categorical}")
+        self.variables["categorical"] = new_variables_categorical
+
+        df = pd.DataFrame(dict(zip(self.variables["continuous"] + self.variables["categorical"] +  self.variables["context"],
                                    torch.cat([continuous, categorical, context], -1).detach().t())))
+        
+        # print(df.head())
+        # print(f"new tens: {torch.cat([continuous, categorical, context], -1).detach()}")
+        for cate_word in self.words_to_int:
+            df[cate_word] = df[cate_word].map(self.int_to_words[cate_word])
+
         return df
 
-    def apply_generator(self, generator, df):
+    def apply_generator(self, generator, df, n_features = 1):
         """
         Replaces or inserts columns in DataFrame that are generated by the generator, of
         size equal to the number of rows in the DataFrame that is passed
@@ -146,11 +273,18 @@ class DataWrapper(object):
         original_columns = df.columns
         x, context = self.preprocess(df)
         x_hat = generator(context)
-        df_hat = self.deprocess(x_hat, context)
-        not_updated = [col for col in list(df_hat.columns) if col not in updated]
-        df_hat = df_hat.drop(not_updated, axis=1).reset_index(drop=True)
+        df_hat = self.deprocess(x_hat, context, n_features)
+
+        print(f"original columns looks like: {original_columns}")
+        # not_updated = [col for col in list(df_hat.columns) if col not in updated]
+        
+        new_columns = pd.Index([col for col in df_hat.columns])
+        # df_hat = df_hat.drop(not_updated, axis=1).reset_index(drop=True)
         df = df.drop(updated, axis=1).reset_index(drop=True)
-        return df_hat.join(df)[original_columns]
+        # print(f"df now looks like: {df}")
+        # print(f"df_hat now looks like: {df_hat}")
+        return df_hat.join(df)[new_columns]
+        return df_hat
 
     def apply_critic(self, critic, df, colname="critic"):
         """
@@ -338,7 +472,8 @@ class Specifications(object):
                  save_checkpoint = None,
                  save_every = 100,
                  print_every = 200,
-                 device = "cuda" if torch.cuda.is_available() else "cpu"):
+                 device = "cuda" if torch.cuda.is_available() else "cpu",
+                 ):
 
         self.settings = locals()
         del self.settings["self"], self.settings["data_wrapper"]
@@ -627,13 +762,17 @@ def compare_dfs(df_real, df_fake, scatterplot=dict(x=[], y=[], samples=400, smoo
     # data prep
     if "source" in list(df_real.columns): df_real = df_real.drop("source", axis=1)
     if "source" in list(df_fake.columns): df_fake = df_fake.drop("source", axis=1)
+
+    
+    common_cols = [c for c in df_real.columns if c in df_fake.columns and isinstance(df_fake.iloc[0][c], float)]
+    common_cols.append("source")
     df_real.insert(0, "source", "real"), df_fake.insert(0, "source", "fake")
-    common_cols = [c for c in df_real.columns if c in df_fake.columns]
     df_joined = pd.concat([df_real[common_cols], df_fake[common_cols]], axis=0, ignore_index=True)
     df_real, df_fake = df_real.drop("source", axis=1), df_fake.drop("source", axis=1)
-    common_cols = [c for c in df_real.columns if c in df_fake.columns]
+    common_cols = [c for c in common_cols if c != "source"]
     # mean and std table
 
+    # print(f"df_joined now looks like : {df_joined}")
     means = df_joined.groupby(table_groupby + ["source"]).mean().round(2).transpose()
     if save:
         means.to_csv(path+"_means.txt",sep=" ")
@@ -795,3 +934,54 @@ def monotonicity_penalty_chetverikov(factor, bound=0, idx_out=4, idx_in=0):
     T = b / (V + 1e-2)
     return T.max().clamp_min(0) * factor
   return penalty
+
+
+if __name__ == '__main__':
+    with open('Electric_Vehicle_Population_Data.csv') as data:
+        df = pd.read_csv(data, usecols = ["Electric Range", "2020 Census Tract", "Postal Code", "Model"]).dropna()
+
+    all_states = collect_features(df, 'Model')
+    top_states = get_top_features(all_states)
+    print(top_states)
+    # df_balanced = df
+    # # # print(df.head())
+
+
+    # # test_gen = Generator(mapping, 100)
+    # # print(test_gen)
+    # # df_balanced = df.sample(2*len(df), weights = (1-df.t.mean())*df.t + df.t.mean()*(1-df.t), replace = True)
+
+
+    # #Dataset attributes: CHOOSE
+    # continuous_vars_gen = ["Electric Range", "2020 Census Tract"]
+    # continuous_lower_bounds_gen = {"Electric Range": 0, "2020 Census Tract": 0}
+    # categorical_vars_gen = ["Postal Code", "Model"]
+    # context_vars_gen = []
+
+    
+    # data_wrapper = DataWrapper(df_balanced, continuous_vars_gen, categorical_vars_gen, [], continuous_lower_bounds_gen)
+    # x, context = data_wrapper.preprocess(df_balanced)
+    # # print(x[0])
+    # # print(data_wrapper.variables)
+    # model_specs = Specifications(data_wrapper, batch_size = 4096, max_epochs = 10, critic_lr = 1e-3, generator_lr = 1e-3, print_every = 10)
+   
+    # #in this case, generators get a prediction from the model
+    # generator = Generator(model_specs)
+
+    # #here, critics act as the loss function
+    # critic = Critic(model_specs)
+
+    
+    # train(generator, critic, x, context, model_specs)
+
+    # # torch.save(generator, 'trained_generator.pth')
+
+    # df_generated = data_wrapper.apply_generator(generator, df.sample(1000, replace = True), 2)
+    
+    # # df_generated = pd.read_csv('generated_df.csv')
+    # # print(df_generated.head())
+    # compare_dfs(df, df_generated)
+    # # generator = torch.load('trained_generator.pth')
+    # # df_generated = data_wrapper.apply_generator(generator, df.sample(100000, replace = True), 2)
+    # df_generated.to_csv('generated_df.csv')
+    
